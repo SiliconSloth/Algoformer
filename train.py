@@ -48,12 +48,12 @@ if __name__ == "__main__":
     run_path = prepare_directory()
     writer = SummaryWriter(run_path)
 
-    n_digits = 6    # Maximum length of input numbers
-    batch_size = 512
-    max_tokens = 24 # Max sequence length
-    vocab_size = 11 # Digits 0..9 + 10 to separate numbers                                                                                            
+    n_digits = 20 # Maximum list length
+    total_batch_elems = 32768 # Total number of values per batch
+    bucket_width = 64 # Increment of batch sizes
+    vocab_size = 12 # Digits 0..9 + 10 to separate lists and 11 to enclose output
 
-    data_generator = DataGenerator(n_digits, batch_size, max_tokens)
+    data_generator = DataGenerator(n_digits, total_batch_elems, bucket_width)
     model = Model(vocab_size)
 
     criterion = torch.nn.NLLLoss()
@@ -65,9 +65,12 @@ if __name__ == "__main__":
         if step % 100 == 0:
             print(f"Step {step}")
 
-        ops_a, ops_b, expected_results, digits_in, mask, mask_bounds = data_generator.next_batch()
+        samples, digits_in, mask, mask_bounds = data_generator.next_batch()
         digits_in = torch.from_numpy(digits_in).cuda()
         mask = torch.from_numpy(mask).cuda()
+
+        batch_size = len(samples)
+        max_tokens = digits_in.shape[1]
 
         embeddings = nn.functional.one_hot(digits_in, vocab_size).to(torch.float).reshape(batch_size, max_tokens, vocab_size)
         embeddings = embeddings[:, :-1] # Drop last token for input sequence
@@ -87,24 +90,23 @@ if __name__ == "__main__":
             eval_output = model(embeddings)
             digits_out = torch.argmax(eval_output, dim=-1)
 
-            # Convert the output digits to numerical values
+            # Extract model outputs
             values_out = []
             for digs, (m_start, m_end) in zip(digits_out.cpu(), mask_bounds):
                 # Account for excluded first token in model output
                 m_start -= 1
-                m_end -= 2 # Also drop 10 from end of output
+                m_end -= 1
                 
-                # Extract and sum output digits
                 res = digs[m_start : m_end].tolist()
-                res = sum(r * 10**i for i, r in enumerate(res))
                 values_out.append(res)
 
             # How many entire output sequences were correct
-            accuracy = torch.mean((torch.tensor(values_out) == torch.tensor(expected_results)).to(float))
+            errors = torch.sum((digits_out != digits_in).to(float) * mask, dim=1)
+            accuracy = 1 - (torch.count_nonzero(errors) / batch_size)
             writer.add_scalar("accuracy", accuracy, step)
 
             # How many individual output digits were correct
-            digit_accuracy = torch.sum((digits_out == digits_in).to(float) * mask) / torch.sum(mask)
+            digit_accuracy = 1 - (torch.sum(errors) / torch.sum(mask))
             writer.add_scalar("digit_accuracy", digit_accuracy, step)
 
             # Stop training once the accuracy is high enough for several consecutive steps
@@ -113,12 +115,14 @@ if __name__ == "__main__":
             else:
                 pass_count = 0
 
-            # Print the problems the model got wrong
-            for op_a, op_b, true_out, pred_out in zip(ops_a, ops_b, expected_results, values_out):
-                if pred_out != true_out:
-                    print(f"{op_a} + {op_b} = {true_out} : {pred_out}")
+            # Print all problems
+            for (inp, out), pred in zip(samples, values_out):
+                print(inp, out, pred)
 
             writer.flush()
+        
+        if step % 5000 == 0 and step > 0:
+            torch.save(model.state_dict(), run_path + f"/model_{step}.pth")
 
         optimizer.zero_grad()
         loss.backward()

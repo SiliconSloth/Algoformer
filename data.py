@@ -1,73 +1,116 @@
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import Process, Queue
 from collections import namedtuple
+from itertools import chain
 import random
 
 
 DataBatch = namedtuple("DataBatch", (
-    "ops_a", "ops_b", "results",
-    "digits_in", "mask", "mask_bounds"
+    "samples", "digits_in", "mask", "mask_bounds"
 ))
 
 
-def split_digits(value):
-    digits = []
-    while value > 0:
-        digits.append(value % 10)
-        value = value // 10
-    return digits
+def make_sample(n_digits):
+    seq_len = random.randint(1, n_digits)
+    inp = [random.randint(0, 9) for _ in range(seq_len)]
+
+    stages = []
+    cur = list(inp)
+    already_sorted = False
+    while not already_sorted:
+        already_sorted = True
+        # Run an iteration of bubble sort
+        for i in range(len(cur) - 1):
+            if cur[i] > cur[i + 1]:
+                tmp = cur[i]
+                cur[i] = cur[i + 1]
+                cur[i + 1] = tmp
+                already_sorted = False
+        
+        # Don't add the stage to output if it was already sorted,
+        # unless the input list was already sorted so this is the only stage.
+        if not (already_sorted and stages):
+            stages.append(cur + [10])
     
-def make_batch(n_digits, batch_size, max_tokens):
-    ops_a, ops_b, results = [], [], []
+    # Output stage does not have 10, and is surrounded by 11
+    stages[-1] = [11] + stages[-1][:-1] + [11]
+    out = list(chain(*stages))
 
-    for _ in range(batch_size):
-        a_len = random.randint(0, n_digits)
-        b_len = random.randint(0, n_digits)
+    inp.append(10)
+    return inp, out
 
-        a = random.randint(0, 10**a_len)
-        b = random.randint(0, 10**b_len)
-        c = a + b
 
-        ops_a.append(a)
-        ops_b.append(b)
-        results.append(c)
+class BatchDispatcher:
+    def __init__(self, batch_size, max_tokens, queue) -> None:
+        self.batch_size = batch_size
+        self.max_tokens = max_tokens
+        self.queue = queue
 
-    # Pack the sequences into tensors
-    digits = np.zeros((batch_size, max_tokens), dtype=np.int64)
-    mask = np.zeros((batch_size, max_tokens))
-    mask_bounds = []
-
-    for i, (a, b, c) in enumerate(zip(ops_a, ops_b, results)):
-        row = split_digits(a) + [10] + split_digits(b) + [10]
-        mask_start = len(row)
-        row += split_digits(c) + [10]
-        mask_end = len(row)
-        row += [0] * (max_tokens - len(row))
-
-        digits[i, :] = row
-        mask[i, mask_start : mask_end] = 1
-        mask_bounds.append((mask_start, mask_end))
+        self.samples = []
     
-    return DataBatch(
-        ops_a, ops_b, results,
-        digits, mask, mask_bounds
-    )
+    def put_sample(self, sample):
+        # Once the batch size is reached, evict an existing sample
+        # at random each time a new one is added.
+        if len(self.samples) < self.batch_size:
+            self.samples.append(sample)
+        else:
+            i = random.randint(0, len(self.samples) - 1)
+            self.samples[i] = sample
+
+    def pack_batch(self):
+        digits = np.zeros((len(self.samples), self.max_tokens), dtype=np.int64)
+        mask = np.zeros((len(self.samples), self.max_tokens))
+        mask_bounds = []
+
+        for i, (inp, out) in enumerate(self.samples):
+            mask_start = len(inp)
+            row = inp + out
+            mask_end = len(row)
+            row += [0] * (self.max_tokens - len(row))
+
+            mask[i, mask_start : mask_end] = 1
+
+            digits[i, :] = row
+            mask_bounds.append((mask_start, mask_end))
+        
+        return DataBatch(
+            self.samples, digits, mask, mask_bounds
+        )
+    
+    def try_dispatch(self):
+        if len(self.samples) == self.batch_size:
+            self.queue.put(self.pack_batch())
 
 
 # Generate training data in separate process to parallelise with training loop
 class DataGenerator:
-    def __init__(self, n_digits, batch_size, max_tokens) -> None:
-        self.params = n_digits, batch_size, max_tokens
+    def __init__(self, n_digits, total_batch_elems, bucket_width) -> None:
+        self.n_digits = n_digits
+        self.total_batch_elems = total_batch_elems
+        self.bucket_width = bucket_width
 
-        self.executor = ProcessPoolExecutor(max_workers=1)
-        self.future = None
+        self.queue = Queue(maxsize=1)
+        self.dispatchers = []
+
+        process = Process(target=self.generator_loop, daemon=True)
+        process.start()
+    
+    def get_dispatcher(self, bucket):
+        while len(self.dispatchers) <= bucket:
+            max_tokens = (bucket + 1) * self.bucket_width
+            batch_size = self.total_batch_elems // max_tokens
+            self.dispatchers.append(BatchDispatcher(batch_size, max_tokens, self.queue))
+        return self.dispatchers[bucket]
+
+    def generator_loop(self):
+        while True:
+            sample = make_sample(self.n_digits)
+            sample_len = len(sample[0]) + len(sample[1])
+            bucket = sample_len // self.bucket_width
+            self.get_dispatcher(bucket).put_sample(sample)
+
+            if not self.queue.full():
+                random.choice(self.dispatchers).try_dispatch()
     
     def next_batch(self):
-        # Make first batch here, otherwise get previous result from executor
-        batch = make_batch(*self.params) if self.future is None else self.future.result()
-        # Start making next batch
-        self.future = self.executor.submit(make_batch, *self.params)
-        return batch
-    
-    def __del__(self):
-        self.executor.shutdown()
+        return self.queue.get()
