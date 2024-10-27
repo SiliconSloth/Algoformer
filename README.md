@@ -1,38 +1,45 @@
-# Learning Algorithms with a Transformer
+# Learning Algorithms from Scratch with a Transformer
 
-### Interactive demo: [https://siliconsloth.com/posts/learning-algorithms-with-a-transformer/](https://siliconsloth.com/posts/learning-algorithms-with-a-transformer/)
+### Interactive demo: [https://siliconsloth.com/posts/learning-algorithms-from-scratch/](https://siliconsloth.com/posts/learning-algorithms-from-scratch/)
 
-This project trains a transformer model to run the bubble sort algorithm.
-Given a list of digits 0-9, the model generates the intermediate steps of bubble sort until the list is sorted.
-This demonstrates how transformers can learn to perform multi-step algorithms of varying length,
-which will hopefully be scaled up to solve complex problems in the future.
+This project trains a transformer model to sort lists using a self-learned algorithm.
+Given a list of digits 0-9, the model generates some blank intermediate tokens followed by the sorted list.
+This demonstrates how transformers can learn their own multi-step procedures to solve
+simple algorithmic problems in an unsupervised manner.
 
 ## Usage
 
-Run `train.py` to train the model. The script will save model checkpoints periodically
-and can be stopped once the accuracy is high enough.
+Run `train.py` to train the model for 6000 steps. The script will save model checkpoints periodically.
 
-Run `test.py` to try out the model on input lists of your choosing.
+Run `test.py` to run the trained model on some example lists and compute an accuracy score.
+Run `test.py --mask-blanks` to see the effect of masking out the blank intermediate tokens.
 
-You can find an interactive demo of the model at [siliconsloth.com](https://siliconsloth.com/posts/learning-algorithms-with-a-transformer/).
+You can find an interactive demo of the model at [siliconsloth.com](https://siliconsloth.com/posts/learning-algorithms-from-scratch/).
 
 ## Requirements
 
 Requires PyTorch and TensorBoard to be installed.
 
-## Data Generation
+## Experiments
 
-Algoformer generates lists of uniformly distributed length for training.
-Some of the resulting bubble sort traces are very long,
-such that the batch size needs to be varied to allow longer sequences to fit in GPU memory
-while maintaining larger batches for shorter sequence lengths.
-To this end, Algoformer sorts the generated training sequences into buckets based on length,
-so that similar length sequences can be batched together using an appropriate batch size.
+![Training runs with blank intermediate tokens](figures/blanks.png)
 
-Another issue is that the bubble sort trace length can vary wildly based on the input list,
-with particularly long traces being very under-represented in the underlying data generation distribution.
-To make the length distribution in the training data more uniform, Algoformer caches a data batch for each
-length bucket described above and randomly replaces samples in the batch as new ones are generated. This means
-longer sequences that appear more rarely in the generation distribution can be saved and reused until new ones
-are generated to replace them. The bucket batches are selected uniformly at random for each training step,
-ensuring that longer sequences appear regularly in the training data.
+The model has a low chance of convergence, so multiple training runs are required to get a model with high accuracy.
+Convergent runs show short, frequent accuracy drops that must be avoided when selecting a model checkpoint for evaluation.
+That said, convergent runs typically seem to converge quickly and evaluation accuracy is strong if the accuracy drops are avoided.
+
+## Ablation Studies
+
+### No intermediate tokens
+![Training runs with no intermediate tokens](figures/no_blanks.png)
+
+Without the intermediate blank tokens, the model never seems to converge.
+
+### No intermediate tokens, with position offsets
+![Training runs with position offsets](figures/pos_offset.png)
+
+One possible explanation for the improved accuracy when using blank intermediate tokens is that the increased
+gap between the input and output tokens makes it easier to attend to them separately.  We can emulate this effect
+by disabling the intermediate tokens but offsetting the position encodings of the output to emulate the presence of
+the intermediate tokens. This approach does not seem to improve accuracy, showing that the blank tokens themselves
+are key to the improved model performance.
